@@ -15,9 +15,17 @@ class TaskStatus(str, Enum):
     failed = "failed"
 
 
+class VideoFormat(str, Enum):
+    portrait = "PORTRAIT"
+    widescreen = "WIDESCREEN"
+    square = "SQUARE"
+
+
 class TaskCreateRequest(BaseModel):
     url: Optional[str] = None
     path: Optional[str] = None
+    video_format: Optional[VideoFormat] = VideoFormat.portrait
+    target_aspect_ratio: Optional[float] = None
 
     @model_validator(mode="after")
     def require_url_or_path(self):
@@ -25,6 +33,8 @@ class TaskCreateRequest(BaseModel):
             raise ValueError("Either 'url' or 'path' must be provided")
         if self.url and self.path:
             raise ValueError("Provide only one of 'url' or 'path', not both")
+        if self.target_aspect_ratio is not None and self.target_aspect_ratio <= 0:
+            raise ValueError("'target_aspect_ratio' must be greater than 0")
         return self
 
 
@@ -40,6 +50,8 @@ class TaskDetail(BaseModel):
     input: Optional[str] = None
     output_path: Optional[str] = None
     error: Optional[str] = None
+    video_format: Optional[VideoFormat] = VideoFormat.portrait
+    target_aspect_ratio: Optional[float] = None
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -49,6 +61,7 @@ class TaskSummary(BaseModel):
     task_id: str
     status: TaskStatus
     progress: float = 0.0
+    video_format: Optional[VideoFormat] = VideoFormat.portrait
     created_at: Optional[datetime] = None
 
 

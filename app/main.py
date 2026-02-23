@@ -76,7 +76,13 @@ def _run_task_sync(task_id: str, input_path: str, output_path: str) -> None:
         task.progress = round(p * 100, 1)
 
     try:
-        run_autoflip(input_path, output_path, progress_callback=progress_cb)
+        run_autoflip(
+            input_path,
+            output_path,
+            progress_callback=progress_cb,
+            video_format=(task.video_format.value if task.video_format else "PORTRAIT"),
+            target_aspect_ratio=task.target_aspect_ratio,
+        )
         task.status = TaskStatus.completed
         task.output_path = output_path
         task.progress = 100.0
@@ -109,9 +115,7 @@ async def _process_task(task_id: str, url: str | None, path: str | None) -> None
 
             # Run in thread pool to avoid blocking the event loop
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                executor, _run_task_sync, task_id, input_path, output_path
-            )
+            await loop.run_in_executor(executor, _run_task_sync, task_id, input_path, output_path)
     except Exception as e:
         task.status = TaskStatus.failed
         task.error = str(e)
@@ -140,6 +144,8 @@ async def create_task(req: TaskCreateRequest):
         task_id=task_id,
         status=TaskStatus.queued,
         input=req.url or req.path,
+        video_format=req.video_format,
+        target_aspect_ratio=req.target_aspect_ratio,
         created_at=datetime.now(timezone.utc),
     )
     tasks[task_id] = task
@@ -164,6 +170,7 @@ async def list_tasks():
             task_id=t.task_id,
             status=t.status,
             progress=t.progress,
+            video_format=t.video_format,
             created_at=t.created_at,
         )
         for t in tasks.values()

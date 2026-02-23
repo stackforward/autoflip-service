@@ -8,20 +8,23 @@ import numpy as np
 import subprocess
 import os
 import tempfile
-import time
-import shutil
 from typing import Callable, Optional
 
 import torch
 from ultralytics import YOLO
 
 # ── Constants ────────────────────────────────────────────────────────────────
-TARGET_ASPECT = 9 / 16
+DEFAULT_TARGET_ASPECT = 9 / 16
 SMOOTHING_WINDOW = 30
 DETECTION_INTERVAL = 3
 BORDER_MARGIN = 0.05
 BATCH_SIZE = 32
 PERSON_CLASS = 0
+VIDEO_FORMAT_TO_ASPECT = {
+    "PORTRAIT": 9 / 16,
+    "WIDESCREEN": 16 / 9,
+    "SQUARE": 1.0,
+}
 
 # ── Singleton model ──────────────────────────────────────────────────────────
 _yolo_model: Optional[YOLO] = None
@@ -58,35 +61,66 @@ def has_nvenc() -> bool:
         return False
 
 
-def _compute_crop(frame_w, frame_h, salient_box, target_aspect):
+def _resolve_target_aspect(
+    *,
+    video_format: Optional[str],
+    target_aspect_ratio: Optional[float],
+) -> float:
+    if target_aspect_ratio is not None:
+        value = float(target_aspect_ratio)
+        if value <= 0:
+            raise ValueError("'target_aspect_ratio' must be greater than 0.")
+        return value
+    normalized_format = str(video_format or "PORTRAIT").strip().upper()
+    return VIDEO_FORMAT_TO_ASPECT.get(normalized_format, DEFAULT_TARGET_ASPECT)
+
+
+def _compute_crop_size(frame_w: int, frame_h: int, target_aspect: float) -> tuple[int, int]:
     crop_h = frame_h
-    crop_w = int(crop_h * target_aspect)
+    crop_w = int(round(crop_h * target_aspect))
     if crop_w > frame_w:
         crop_w = frame_w
-        crop_h = int(crop_w / target_aspect)
+        crop_h = int(round(crop_w / target_aspect))
+    crop_w = max(2, crop_w)
+    crop_h = max(2, crop_h)
+    return crop_w, crop_h
 
-    if salient_box is not None:
-        sx1, sy1, sx2, sy2 = salient_box
-        center_x = (sx1 + sx2) / 2 * frame_w
-        center_y = (sy1 + sy2) / 2 * frame_h
-    else:
-        center_x = frame_w / 2
-        center_y = frame_h / 2
 
-    x = int(center_x - crop_w / 2)
-    y = int(center_y - crop_h / 2)
+def _compute_crop_from_center(
+    frame_w: int,
+    frame_h: int,
+    center_x: float,
+    center_y: float,
+    crop_w: int,
+    crop_h: int,
+) -> tuple[int, int, int, int]:
+    x = int(round(center_x - crop_w / 2))
+    y = int(round(center_y - crop_h / 2))
     x = max(0, min(x, frame_w - crop_w))
     y = max(0, min(y, frame_h - crop_h))
     return x, y, crop_w, crop_h
 
 
+def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    if len(values) <= 1:
+        return values.astype(np.float32)
+    window = max(1, min(window, len(values)))
+    if window % 2 == 0:
+        window = max(1, window - 1)
+    if window <= 1:
+        return values.astype(np.float32)
+    pad = window // 2
+    padded = np.pad(values.astype(np.float32), (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def _smooth_positions(positions, window):
     if not positions:
         return positions
-    arr = np.array(positions)
-    kernel = np.ones(window) / window
-    smoothed_x = np.convolve(arr[:, 0], kernel, mode="same").astype(int)
-    smoothed_y = np.convolve(arr[:, 1], kernel, mode="same").astype(int)
+    arr = np.array(positions, dtype=np.float32)
+    smoothed_x = np.round(_moving_average(arr[:, 0], window)).astype(int)
+    smoothed_y = np.round(_moving_average(arr[:, 1], window)).astype(int)
     return list(
         zip(
             smoothed_x.tolist(),
@@ -97,10 +131,54 @@ def _smooth_positions(positions, window):
     )
 
 
+def _interpolate_centers(
+    detection_results: dict[int, Optional[tuple[float, float, float, float]]],
+    all_frame_count: int,
+    frame_w: int,
+    frame_h: int,
+) -> list[tuple[float, float]]:
+    default_center = (frame_w / 2.0, frame_h / 2.0)
+    keyframes: list[tuple[int, float, float]] = []
+    for frame_idx in sorted(detection_results.keys()):
+        box = detection_results.get(frame_idx)
+        if box is None:
+            continue
+        sx1, sy1, sx2, sy2 = box
+        center_x = ((sx1 + sx2) / 2.0) * frame_w
+        center_y = ((sy1 + sy2) / 2.0) * frame_h
+        keyframes.append((frame_idx, center_x, center_y))
+
+    if not keyframes:
+        return [default_center for _ in range(all_frame_count)]
+
+    centers: list[tuple[float, float]] = [default_center for _ in range(all_frame_count)]
+    first_idx, first_x, first_y = keyframes[0]
+    for frame_idx in range(0, min(first_idx + 1, all_frame_count)):
+        centers[frame_idx] = (first_x, first_y)
+
+    for left_idx in range(len(keyframes) - 1):
+        start_frame, start_x, start_y = keyframes[left_idx]
+        end_frame, end_x, end_y = keyframes[left_idx + 1]
+        span = max(1, end_frame - start_frame)
+        for frame_idx in range(start_frame, min(end_frame + 1, all_frame_count)):
+            alpha = (frame_idx - start_frame) / float(span)
+            x = start_x + (end_x - start_x) * alpha
+            y = start_y + (end_y - start_y) * alpha
+            centers[frame_idx] = (x, y)
+
+    last_idx, last_x, last_y = keyframes[-1]
+    for frame_idx in range(max(0, last_idx), all_frame_count):
+        centers[frame_idx] = (last_x, last_y)
+
+    return centers
+
+
 def run_autoflip(
     input_path: str,
     output_path: str,
     progress_callback: Optional[Callable[[float], None]] = None,
+    video_format: str = "PORTRAIT",
+    target_aspect_ratio: Optional[float] = None,
 ) -> None:
     """Run AutoFlip on input_path and write result to output_path.
 
@@ -109,6 +187,10 @@ def run_autoflip(
     yolo = load_model()
     device = _device
     use_nvenc = has_nvenc()
+    target_aspect = _resolve_target_aspect(
+        video_format=video_format,
+        target_aspect_ratio=target_aspect_ratio,
+    )
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -126,6 +208,10 @@ def run_autoflip(
     print(
         f"[AutoFlip] Source: {frame_w}x{frame_h} @ {fps}fps, "
         f"{total_frames} frames (~{total_frames / fps:.0f}s)"
+    )
+    print(
+        f"[AutoFlip] Target format={str(video_format or 'PORTRAIT').upper()}, "
+        f"aspect={target_aspect:.4f}"
     )
 
     # ── Pass 1: Read frames for detection ────────────────────────────────
@@ -179,7 +265,7 @@ def run_autoflip(
                 detection_results[fidx] = None
 
         done = min(batch_start + BATCH_SIZE, len(detection_frames))
-        if progress_callback:
+        if progress_callback and len(detection_frames) > 0:
             # Pass 1 is 0–50%
             progress_callback(done / len(detection_frames) * 0.5)
 
@@ -188,16 +274,15 @@ def run_autoflip(
         torch.cuda.empty_cache()
 
     # ── Build & smooth crop positions ────────────────────────────────────
-    crop_positions = []
-    last_box = None
-    for fidx in range(all_frame_count):
-        if fidx in detection_results and detection_results[fidx] is not None:
-            last_box = detection_results[fidx]
-        x, y, cw, ch = _compute_crop(frame_w, frame_h, last_box, TARGET_ASPECT)
-        crop_positions.append((x, y, cw, ch))
+    crop_w, crop_h = _compute_crop_size(frame_w, frame_h, target_aspect)
+    frame_centers = _interpolate_centers(detection_results, all_frame_count, frame_w, frame_h)
+    raw_positions = [
+        _compute_crop_from_center(frame_w, frame_h, cx, cy, crop_w, crop_h)
+        for cx, cy in frame_centers
+    ]
 
     del detection_results
-    crop_positions = _smooth_positions(crop_positions, SMOOTHING_WINDOW)
+    crop_positions = _smooth_positions(raw_positions, SMOOTHING_WINDOW)
 
     # ── Pass 2: Write cropped video ──────────────────────────────────────
     crop_w, crop_h = int(crop_positions[0][2]), int(crop_positions[0][3])
