@@ -25,6 +25,14 @@ VIDEO_FORMAT_TO_ASPECT = {
     "WIDESCREEN": 16 / 9,
     "SQUARE": 1.0,
 }
+# Standard output resolutions per format (width x height).
+VIDEO_FORMAT_TO_RESOLUTION = {
+    "PORTRAIT": (1080, 1920),
+    "WIDESCREEN": (1920, 1080),
+    "SQUARE": (1080, 1080),
+}
+# Tolerance for comparing source aspect to target aspect.
+_ASPECT_TOLERANCE = 0.08
 
 # ── Singleton model ──────────────────────────────────────────────────────────
 _yolo_model: Optional[YOLO] = None
@@ -73,6 +81,37 @@ def _resolve_target_aspect(
         return value
     normalized_format = str(video_format or "PORTRAIT").strip().upper()
     return VIDEO_FORMAT_TO_ASPECT.get(normalized_format, DEFAULT_TARGET_ASPECT)
+
+
+def _resolve_output_resolution(
+    video_format: Optional[str],
+    crop_w: int,
+    crop_h: int,
+) -> tuple[int, int]:
+    """Determine the final output resolution.
+
+    Uses the standard resolution for the format when the crop is smaller,
+    otherwise keeps the native crop size to avoid unnecessary upscaling of
+    already-large sources.
+    """
+    normalized_format = str(video_format or "PORTRAIT").strip().upper()
+    standard = VIDEO_FORMAT_TO_RESOLUTION.get(normalized_format)
+    if standard is None:
+        return crop_w, crop_h
+    std_w, std_h = standard
+    # Only upscale when the crop is smaller than the standard resolution.
+    # If the crop is already larger, keep it to preserve quality.
+    if crop_w < std_w or crop_h < std_h:
+        return std_w, std_h
+    return crop_w, crop_h
+
+
+def _source_matches_target(frame_w: int, frame_h: int, target_aspect: float) -> bool:
+    """Check if the source video already matches the target aspect ratio."""
+    if frame_w <= 0 or frame_h <= 0:
+        return False
+    source_aspect = float(frame_w) / float(frame_h)
+    return abs(source_aspect - target_aspect) <= _ASPECT_TOLERANCE
 
 
 def _compute_crop_size(frame_w: int, frame_h: int, target_aspect: float) -> tuple[int, int]:
@@ -214,6 +253,36 @@ def run_autoflip(
         f"aspect={target_aspect:.4f}"
     )
 
+    # ── Fast path: source already matches the target aspect ──────────────
+    if _source_matches_target(frame_w, frame_h, target_aspect):
+        cap.release()
+        out_w, out_h = _resolve_output_resolution(video_format, frame_w, frame_h)
+        print(
+            f"[AutoFlip] Source already matches target aspect ratio "
+            f"({frame_w}x{frame_h} ≈ {target_aspect:.4f}). "
+            f"Scaling to {out_w}x{out_h}."
+        )
+        encoder = "h264_nvenc" if use_nvenc else "libx264"
+        cmd = ["ffmpeg", "-y"]
+        if use_nvenc:
+            cmd += ["-hwaccel", "cuda"]
+        cmd += ["-i", input_path]
+        if out_w != frame_w or out_h != frame_h:
+            cmd += ["-vf", f"scale={out_w}:{out_h}"]
+        if use_nvenc:
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+        cmd += ["-c:a", "copy", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg scaling failed: {result.stderr[-1000:]}")
+        if progress_callback:
+            progress_callback(1.0)
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"[AutoFlip] Done (pass-through) — {output_path} ({size_mb:.1f} MB, {out_w}x{out_h})")
+        return
+
     # ── Pass 1: Read frames for detection ────────────────────────────────
     detection_frames = []
     all_frame_count = 0
@@ -230,6 +299,7 @@ def run_autoflip(
 
     # ── Run YOLO in batches ──────────────────────────────────────────────
     detection_results = {}
+    detected_count = 0
     for batch_start in range(0, len(detection_frames), BATCH_SIZE):
         batch = detection_frames[batch_start : batch_start + BATCH_SIZE]
         batch_imgs = [f[1] for f in batch]
@@ -261,6 +331,7 @@ def run_autoflip(
                 mx2 = min(1, mx2 + bw * BORDER_MARGIN)
                 my2 = min(1, my2 + bh * BORDER_MARGIN)
                 detection_results[fidx] = (mx1, my1, mx2, my2)
+                detected_count += 1
             else:
                 detection_results[fidx] = None
 
@@ -268,6 +339,14 @@ def run_autoflip(
         if progress_callback and len(detection_frames) > 0:
             # Pass 1 is 0–50%
             progress_callback(done / len(detection_frames) * 0.5)
+
+    detection_rate = (detected_count / len(detection_frames) * 100) if detection_frames else 0
+    print(
+        f"[AutoFlip] Detection complete: {detected_count}/{len(detection_frames)} "
+        f"frames with person ({detection_rate:.1f}%)"
+    )
+    if detection_rate < 10:
+        print("[AutoFlip] WARNING: Very low person detection rate — output will use center crop.")
 
     del detection_frames
     if torch.cuda.is_available():
@@ -286,7 +365,12 @@ def run_autoflip(
 
     # ── Pass 2: Write cropped video ──────────────────────────────────────
     crop_w, crop_h = int(crop_positions[0][2]), int(crop_positions[0][3])
-    print(f"[AutoFlip] Pass 2: Writing {crop_w}x{crop_h} cropped video")
+    out_w, out_h = _resolve_output_resolution(video_format, crop_w, crop_h)
+    needs_scale = (out_w != crop_w or out_h != crop_h)
+    print(
+        f"[AutoFlip] Pass 2: Cropping to {crop_w}x{crop_h}"
+        + (f", scaling to {out_w}x{out_h}" if needs_scale else "")
+    )
 
     tmp_video = tempfile.mktemp(suffix=".mp4")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -315,7 +399,7 @@ def run_autoflip(
     if progress_callback:
         progress_callback(0.9)
 
-    # ── Mux audio with encoding ──────────────────────────────────────────
+    # ── Mux audio with encoding (+ optional scale to standard resolution) ─
     encoder = "h264_nvenc" if use_nvenc else "libx264"
     print(f"[AutoFlip] Encoding with {encoder}")
 
@@ -328,6 +412,9 @@ def run_autoflip(
         "-i", tmp_video,
         "-i", input_path,
     ]
+    # Apply scaling to standard resolution if needed.
+    if needs_scale:
+        cmd += ["-vf", f"scale={out_w}:{out_h}"]
     if use_nvenc:
         cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]
     else:
@@ -349,4 +436,4 @@ def run_autoflip(
         progress_callback(1.0)
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"[AutoFlip] Done — {output_path} ({size_mb:.1f} MB, {crop_w}x{crop_h})")
+    print(f"[AutoFlip] Done — {output_path} ({size_mb:.1f} MB, {out_w}x{out_h})")
