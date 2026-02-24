@@ -52,6 +52,9 @@ class TaskDetail(BaseModel):
     error: Optional[str] = None
     video_format: Optional[VideoFormat] = VideoFormat.portrait
     target_aspect_ratio: Optional[float] = None
+    processing_device: Optional[str] = None
+    encoding_device: Optional[str] = None
+    video_encoder: Optional[str] = None
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -62,6 +65,9 @@ class TaskSummary(BaseModel):
     status: TaskStatus
     progress: float = 0.0
     video_format: Optional[VideoFormat] = VideoFormat.portrait
+    processing_device: Optional[str] = None
+    encoding_device: Optional[str] = None
+    video_encoder: Optional[str] = None
     created_at: Optional[datetime] = None
 
 

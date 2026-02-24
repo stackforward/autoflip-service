@@ -76,13 +76,16 @@ def _run_task_sync(task_id: str, input_path: str, output_path: str) -> None:
         task.progress = round(p * 100, 1)
 
     try:
-        run_autoflip(
+        runtime_info = run_autoflip(
             input_path,
             output_path,
             progress_callback=progress_cb,
             video_format=(task.video_format.value if task.video_format else "PORTRAIT"),
             target_aspect_ratio=task.target_aspect_ratio,
         )
+        task.processing_device = runtime_info.get("processing_device")
+        task.encoding_device = runtime_info.get("encoding_device")
+        task.video_encoder = runtime_info.get("video_encoder")
         task.status = TaskStatus.completed
         task.output_path = output_path
         task.progress = 100.0
@@ -171,6 +174,9 @@ async def list_tasks():
             status=t.status,
             progress=t.progress,
             video_format=t.video_format,
+            processing_device=t.processing_device,
+            encoding_device=t.encoding_device,
+            video_encoder=t.video_encoder,
             created_at=t.created_at,
         )
         for t in tasks.values()

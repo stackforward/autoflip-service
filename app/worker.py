@@ -20,6 +20,13 @@ DETECTION_INTERVAL = 3
 BORDER_MARGIN = 0.05
 BATCH_SIZE = 32
 PERSON_CLASS = 0
+# Stabilization settings to avoid motion sickness from frequent reframing.
+STABILITY_DEADZONE_X_RATIO = 0.10
+STABILITY_DEADZONE_Y_RATIO = 0.06
+STABILITY_EMA_ALPHA_X = 0.12
+STABILITY_EMA_ALPHA_Y = 0.16
+MAX_PAN_SPEED_X_RATIO_PER_SEC = 0.22
+MAX_PAN_SPEED_Y_RATIO_PER_SEC = 0.28
 VIDEO_FORMAT_TO_ASPECT = {
     "PORTRAIT": 9 / 16,
     "WIDESCREEN": 16 / 9,
@@ -111,6 +118,14 @@ def _video_codec_args(use_nvenc: bool) -> list[str]:
     return ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
 
 
+def _inference_device_label(device: str) -> str:
+    return "GPU" if str(device).lower().startswith("cuda") else "CPU"
+
+
+def _encoder_device_label(encoder: str) -> str:
+    return "GPU" if encoder == "h264_nvenc" else "CPU"
+
+
 def _is_nvenc_runtime_error(stderr: str) -> bool:
     lowered = (stderr or "").lower()
     markers = (
@@ -129,18 +144,20 @@ def _run_ffmpeg_command(
     cmd: list[str],
     *,
     error_label: str,
+    primary_encoder: str,
     fallback_cmd: Optional[list[str]] = None,
-) -> None:
+    fallback_encoder: Optional[str] = None,
+) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode == 0:
-        return
+        return primary_encoder
 
     stderr = result.stderr or ""
     if fallback_cmd and _is_nvenc_runtime_error(stderr):
         print("[AutoFlip] NVENC unavailable during encode; retrying with libx264.")
         fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
         if fallback_result.returncode == 0:
-            return
+            return fallback_encoder or "libx264"
         result = fallback_result
         stderr = result.stderr or ""
 
@@ -232,6 +249,61 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")
 
 
+def _clamp_step(value: float, max_abs_step: float) -> float:
+    if value > max_abs_step:
+        return max_abs_step
+    if value < -max_abs_step:
+        return -max_abs_step
+    return value
+
+
+def _stabilize_centers(
+    centers: list[tuple[float, float]],
+    *,
+    crop_w: int,
+    crop_h: int,
+    fps: float,
+) -> list[tuple[float, float]]:
+    """Stabilize camera path to reduce small oscillations and abrupt pans."""
+    if not centers:
+        return centers
+
+    safe_fps = max(float(fps or 0.0), 1.0)
+    deadzone_x = crop_w * STABILITY_DEADZONE_X_RATIO
+    deadzone_y = crop_h * STABILITY_DEADZONE_Y_RATIO
+    max_step_x = (crop_w * MAX_PAN_SPEED_X_RATIO_PER_SEC) / safe_fps
+    max_step_y = (crop_h * MAX_PAN_SPEED_Y_RATIO_PER_SEC) / safe_fps
+
+    smoothed: list[tuple[float, float]] = []
+    sx, sy = float(centers[0][0]), float(centers[0][1])
+    smoothed.append((sx, sy))
+
+    for tx, ty in centers[1:]:
+        dx = float(tx) - sx
+        dy = float(ty) - sy
+
+        if abs(dx) <= deadzone_x:
+            target_x = sx
+        else:
+            target_x = sx + np.sign(dx) * (abs(dx) - deadzone_x)
+
+        if abs(dy) <= deadzone_y:
+            target_y = sy
+        else:
+            target_y = sy + np.sign(dy) * (abs(dy) - deadzone_y)
+
+        nx = sx + STABILITY_EMA_ALPHA_X * (target_x - sx)
+        ny = sy + STABILITY_EMA_ALPHA_Y * (target_y - sy)
+
+        step_x = _clamp_step(nx - sx, max_step_x)
+        step_y = _clamp_step(ny - sy, max_step_y)
+        sx += step_x
+        sy += step_y
+        smoothed.append((sx, sy))
+
+    return smoothed
+
+
 def _smooth_positions(positions, window):
     if not positions:
         return positions
@@ -296,7 +368,7 @@ def run_autoflip(
     progress_callback: Optional[Callable[[float], None]] = None,
     video_format: str = "PORTRAIT",
     target_aspect_ratio: Optional[float] = None,
-) -> None:
+) -> dict[str, str]:
     """Run AutoFlip on input_path and write result to output_path.
 
     Raises on failure. Calls progress_callback(0.0–1.0) during processing.
@@ -348,12 +420,22 @@ def run_autoflip(
         cpu_cmd = base_cmd + _video_codec_args(False) + ["-c:a", "copy", output_path]
         cmd = nvenc_cmd if use_nvenc else cpu_cmd
         fallback_cmd = cpu_cmd if use_nvenc else None
-        _run_ffmpeg_command(cmd, error_label="ffmpeg scaling failed", fallback_cmd=fallback_cmd)
+        used_encoder = _run_ffmpeg_command(
+            cmd,
+            error_label="ffmpeg scaling failed",
+            primary_encoder="h264_nvenc" if use_nvenc else "libx264",
+            fallback_cmd=fallback_cmd,
+            fallback_encoder="libx264",
+        )
         if progress_callback:
             progress_callback(1.0)
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"[AutoFlip] Done (pass-through) — {output_path} ({size_mb:.1f} MB, {out_w}x{out_h})")
-        return
+        return {
+            "processing_device": _inference_device_label(device),
+            "encoding_device": _encoder_device_label(used_encoder),
+            "video_encoder": used_encoder,
+        }
 
     # ── Pass 1: Read frames for detection ────────────────────────────────
     detection_frames = []
@@ -427,6 +509,12 @@ def run_autoflip(
     # ── Build & smooth crop positions ────────────────────────────────────
     crop_w, crop_h = _compute_crop_size(frame_w, frame_h, target_aspect)
     frame_centers = _interpolate_centers(detection_results, all_frame_count, frame_w, frame_h)
+    frame_centers = _stabilize_centers(
+        frame_centers,
+        crop_w=crop_w,
+        crop_h=crop_h,
+        fps=fps,
+    )
     raw_positions = [
         _compute_crop_from_center(frame_w, frame_h, cx, cy, crop_w, crop_h)
         for cx, cy in frame_centers
@@ -495,7 +583,13 @@ def run_autoflip(
     fallback_cmd = cpu_cmd if use_nvenc else None
 
     try:
-        _run_ffmpeg_command(cmd, error_label="ffmpeg encoding failed", fallback_cmd=fallback_cmd)
+        used_encoder = _run_ffmpeg_command(
+            cmd,
+            error_label="ffmpeg encoding failed",
+            primary_encoder="h264_nvenc" if use_nvenc else "libx264",
+            fallback_cmd=fallback_cmd,
+            fallback_encoder="libx264",
+        )
     finally:
         os.unlink(tmp_video)
 
@@ -504,3 +598,8 @@ def run_autoflip(
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"[AutoFlip] Done — {output_path} ({size_mb:.1f} MB, {out_w}x{out_h})")
+    return {
+        "processing_device": _inference_device_label(device),
+        "encoding_device": _encoder_device_label(used_encoder),
+        "video_encoder": used_encoder,
+    }
