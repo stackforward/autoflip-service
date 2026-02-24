@@ -37,6 +37,7 @@ _ASPECT_TOLERANCE = 0.08
 # ── Singleton model ──────────────────────────────────────────────────────────
 _yolo_model: Optional[YOLO] = None
 _device: str = "cpu"
+_nvenc_available: Optional[bool] = None
 
 
 def get_device() -> str:
@@ -58,15 +59,92 @@ def load_model() -> YOLO:
 
 
 def has_nvenc() -> bool:
-    """Check if ffmpeg supports h264_nvenc."""
+    """Check if ffmpeg can actually encode with h264_nvenc on this host."""
+    global _nvenc_available
+    if _nvenc_available is not None:
+        return _nvenc_available
+
     try:
-        result = subprocess.run(
+        encoders = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=10,
         )
-        return "h264_nvenc" in result.stdout
+        if "h264_nvenc" not in encoders.stdout:
+            _nvenc_available = False
+            return False
+
+        # A listed encoder can still fail at runtime if driver/libs are unavailable.
+        probe = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=32x32:r=1:d=0.1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_nvenc",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        _nvenc_available = probe.returncode == 0
+        if not _nvenc_available:
+            print("[AutoFlip] h264_nvenc detected but unavailable at runtime; using libx264.")
+        return _nvenc_available
     except Exception:
+        _nvenc_available = False
         return False
+
+
+def _video_codec_args(use_nvenc: bool) -> list[str]:
+    if use_nvenc:
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+
+
+def _is_nvenc_runtime_error(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    markers = (
+        "cannot load libnvidia-encode.so",
+        "cannot load libnvcuvid.so",
+        "failed loading nvcuvid",
+        "hwaccel initialisation returned error",
+        "no nvenc capable devices found",
+        "the minimum required nvidia driver for nvenc",
+        "cannot init cuda",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _run_ffmpeg_command(
+    cmd: list[str],
+    *,
+    error_label: str,
+    fallback_cmd: Optional[list[str]] = None,
+) -> None:
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    stderr = result.stderr or ""
+    if fallback_cmd and _is_nvenc_runtime_error(stderr):
+        print("[AutoFlip] NVENC unavailable during encode; retrying with libx264.")
+        fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
+        if fallback_result.returncode == 0:
+            return
+        result = fallback_result
+        stderr = result.stderr or ""
+
+    raise RuntimeError(f"{error_label}: {stderr[-1000:]}")
 
 
 def _resolve_target_aspect(
@@ -263,20 +341,14 @@ def run_autoflip(
             f"Scaling to {out_w}x{out_h}."
         )
         encoder = "h264_nvenc" if use_nvenc else "libx264"
-        cmd = ["ffmpeg", "-y"]
-        if use_nvenc:
-            cmd += ["-hwaccel", "cuda"]
-        cmd += ["-i", input_path]
+        base_cmd = ["ffmpeg", "-y", "-i", input_path]
         if out_w != frame_w or out_h != frame_h:
-            cmd += ["-vf", f"scale={out_w}:{out_h}"]
-        if use_nvenc:
-            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]
-        else:
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
-        cmd += ["-c:a", "copy", output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg scaling failed: {result.stderr[-1000:]}")
+            base_cmd += ["-vf", f"scale={out_w}:{out_h}"]
+        nvenc_cmd = base_cmd + _video_codec_args(True) + ["-c:a", "copy", output_path]
+        cpu_cmd = base_cmd + _video_codec_args(False) + ["-c:a", "copy", output_path]
+        cmd = nvenc_cmd if use_nvenc else cpu_cmd
+        fallback_cmd = cpu_cmd if use_nvenc else None
+        _run_ffmpeg_command(cmd, error_label="ffmpeg scaling failed", fallback_cmd=fallback_cmd)
         if progress_callback:
             progress_callback(1.0)
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -403,34 +475,29 @@ def run_autoflip(
     encoder = "h264_nvenc" if use_nvenc else "libx264"
     print(f"[AutoFlip] Encoding with {encoder}")
 
-    cmd = [
+    base_cmd = [
         "ffmpeg", "-y",
-    ]
-    if use_nvenc:
-        cmd += ["-hwaccel", "cuda"]
-    cmd += [
         "-i", tmp_video,
         "-i", input_path,
     ]
     # Apply scaling to standard resolution if needed.
     if needs_scale:
-        cmd += ["-vf", f"scale={out_w}:{out_h}"]
-    if use_nvenc:
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]
-    else:
-        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
-    cmd += [
+        base_cmd += ["-vf", f"scale={out_w}:{out_h}"]
+    tail_cmd = [
         "-c:a", "copy",
         "-map", "0:v:0", "-map", "1:a:0?",
         "-shortest",
         output_path,
     ]
+    nvenc_cmd = base_cmd + _video_codec_args(True) + tail_cmd
+    cpu_cmd = base_cmd + _video_codec_args(False) + tail_cmd
+    cmd = nvenc_cmd if use_nvenc else cpu_cmd
+    fallback_cmd = cpu_cmd if use_nvenc else None
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    os.unlink(tmp_video)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg encoding failed: {result.stderr[-1000:]}")
+    try:
+        _run_ffmpeg_command(cmd, error_label="ffmpeg encoding failed", fallback_cmd=fallback_cmd)
+    finally:
+        os.unlink(tmp_video)
 
     if progress_callback:
         progress_callback(1.0)
